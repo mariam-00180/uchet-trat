@@ -90,7 +90,7 @@ func (a *App) routes() http.Handler {
 	mux.HandleFunc("/delete", a.authRequired(a.deleteHandler))
 	mux.HandleFunc("/stats", a.authRequired(a.statsHandler))
 	mux.HandleFunc("/export.csv", a.authRequired(a.exportHandler))
-	return requestLogger(a.csrfCookie(mux))
+	return recoveryMiddleware(requestLogger(a.csrfCookie(mux)))
 }
 
 func requestLogger(next http.Handler) http.Handler {
@@ -533,4 +533,16 @@ func pbkdf2SHA256(password, salt []byte, iterations, keyLen int) []byte {
 		out = append(out, t...)
 	}
 	return out[:keyLen]
+}
+func recoveryMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer func() {
+			if err := recover(); err != nil {
+				log.Printf("Panic recovered: %v", err)
+				http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+			}
+		}()
+
+		next.ServeHTTP(w, r)
+	})
 }
