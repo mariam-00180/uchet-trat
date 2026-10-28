@@ -1,13 +1,10 @@
-
-# قاعدة البيانات والبيانات المحلية
+.env
 expenses.db
 expenses.db-*
-
-# الملفات الاحتياطية
+*.db-shm
+*.db-wal
+expenses.txt
 *_backup.txt
-
-# البرنامج التنفيذي
 uchet-trat.exe
-
-# ملفات وأدوات Git المحلية
+*.exe
 .vscode/

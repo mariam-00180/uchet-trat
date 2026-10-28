@@ -5,8 +5,10 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"database/sql"
+	"embed"
 	"encoding/base64"
 	"encoding/csv"
+	"encoding/json"
 	"fmt"
 	"html/template"
 	"log"
@@ -18,6 +20,42 @@ import (
 )
 
 type App struct{ db *sql.DB }
+
+//go:embed templates/404.html templates/500.html
+var errorTemplateFiles embed.FS
+
+var errorTemplates = template.Must(template.ParseFS(errorTemplateFiles, "templates/404.html", "templates/500.html"))
+
+type statusWriter struct {
+	http.ResponseWriter
+	status int
+}
+
+func (w *statusWriter) WriteHeader(code int) {
+	if w.status == 0 {
+		w.status = code
+	}
+	w.ResponseWriter.WriteHeader(code)
+}
+func (w *statusWriter) Write(b []byte) (int, error) {
+	if w.status == 0 {
+		w.WriteHeader(http.StatusOK)
+	}
+	return w.ResponseWriter.Write(b)
+}
+
+func writeErrorPage(w http.ResponseWriter, status int) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(status)
+	name := "500.html"
+	if status == http.StatusNotFound {
+		name = "404.html"
+	}
+	if err := errorTemplates.ExecuteTemplate(w, name, nil); err != nil {
+		http.Error(w, http.StatusText(status), status)
+	}
+}
+
 type User struct {
 	ID       int
 	Username string
@@ -66,7 +104,17 @@ var pageTemplate = template.Must(template.New("page").Funcs(template.FuncMap{
 <section class="section"><h2>Добавить расход</h2><form action="/add" method="post"><input type="hidden" name="csrf" value="{{.CSRF}}"><label>Категория</label><input name="category" required maxlength="80" placeholder="Например, продукты"><label>Сумма (руб.)</label><input type="number" name="amount" min="0.01" max="100000000" step="0.01" required><label>Дата</label><input type="date" name="expense_date" value="{{.Today}}" required><button type="submit">Добавить расход</button></form></section>
 <section class="section"><h2>Список расходов</h2>{{if .Expenses}}<div class="table-wrap"><table><thead><tr><th>ID</th><th>Категория</th><th>Сумма</th><th>Дата</th><th>Действия</th></tr></thead><tbody>{{range .Expenses}}<tr><td>{{.ID}}</td><td>{{.Category}}</td><td>{{money .Amount}} руб.</td><td>{{if or (eq .ExpenseDate "1970-01-01") (eq .ExpenseDate "")}}—{{else}}{{.ExpenseDate}}{{end}}</td><td><div class="actions"><a class="button secondary" href="/edit?id={{.ID}}">Изменить</a><form action="/delete" method="post" onsubmit="return confirm('Удалить расход?')"><input type="hidden" name="csrf" value="{{$.CSRF}}"><input type="hidden" name="id" value="{{.ID}}"><button class="danger" type="submit">Удалить</button></form></div></td></tr>{{end}}</tbody></table></div>{{else}}<p class="muted">Расходов по выбранному фильтру нет.</p>{{end}}</section>
 {{else if eq .Kind "edit"}}<section class="section"><h2>Изменить расход</h2><form action="/edit" method="post"><input type="hidden" name="csrf" value="{{.CSRF}}"><input type="hidden" name="id" value="{{.Edit.ID}}"><label>Категория</label><input name="category" required maxlength="80" value="{{.Edit.Category}}"><label>Сумма (руб.)</label><input type="number" name="amount" min="0.01" max="100000000" step="0.01" required value="{{money .Edit.Amount}}"><label>Дата</label><input type="date" name="expense_date" required value="{{.Edit.ExpenseDate}}"><button type="submit">Сохранить изменения</button> <a href="/">Назад</a></form></section>
-{{else if eq .Kind "stats"}}<section class="cards"><div class="card"><h3>Всего потрачено</h3><div class="value">{{money .Total}} руб.</div></div><div class="card"><h3>Количество расходов</h3><div class="value">{{.Count}}</div></div></section><section class="section"><h2>Расходы по категориям</h2>{{if .Categories}}{{range .Categories}}<div class="bar-row"><span>{{.Category}}</span><div class="bar"><span style="width:{{.Percent}}%"></span></div><b>{{money .Total}}</b></div>{{end}}{{else}}<p>Пока нет данных для статистики.</p>{{end}}</section><section class="section"><h2>Расходы по месяцам</h2>{{if .Months}}{{range .Months}}<div class="bar-row"><span>{{.Month}}</span><div class="bar"><span style="width:{{.Percent}}%"></span></div><b>{{money .Total}}</b></div>{{end}}{{else}}<p>Пока нет данных для статистики.</p>{{end}}</section><a class="button secondary" href="/">Назад к расходам</a>
+{{else if eq .Kind "stats"}}<section class="cards"><div class="card"><h3>Всего потрачено</h3><div class="value">{{money .Total}} руб.</div></div><div class="card"><h3>Количество расходов</h3><div class="value">{{.Count}}</div></div></section><section class="section"><h2>Расходы по категориям</h2>{{if .Categories}}{{range .Categories}}<div class="bar-row"><span>{{.Category}}</span><div class="bar"><span style="width:{{.Percent}}%"></span></div><b>{{money .Total}}</b></div>{{end}}{{else}}<p>Пока нет данных для статистики.</p>{{end}}</section><section class="section"><h2>Расходы по месяцам</h2>{{if .Months}}{{range .Months}}<div class="bar-row"><span>{{.Month}}</span><div class="bar"><span style="width:{{.Percent}}%"></span></div><b>{{money .Total}}</b></div>{{end}}{{else}}<p>Пока нет данных для статистики.</p>{{end}}</section><section class="section"><h2>Графики статистики</h2><div class="chart-grid"><div><canvas id="categoryChart" aria-label="Расходы по категориям"></canvas></div><div><canvas id="monthChart" aria-label="Расходы по месяцам"></canvas></div></div></section><script src="https://cdn.jsdelivr.net/npm/chart.js"></script><script>
+(async function(){
+ if(!window.Chart)return;
+ try {
+  const [catRes,monthRes]=await Promise.all([fetch('/api/stats/by-category'),fetch('/api/stats/by-month')]);
+  if(!catRes.ok||!monthRes.ok)throw new Error('Не удалось загрузить статистику');
+  const cats=await catRes.json(), months=await monthRes.json();
+  new Chart(document.getElementById('categoryChart'),{type:'pie',data:{labels:cats.map(x=>x.label),datasets:[{data:cats.map(x=>x.value)}]},options:{responsive:true,plugins:{title:{display:true,text:'Расходы по категориям'}}}});
+  new Chart(document.getElementById('monthChart'),{type:'bar',data:{labels:months.map(x=>x.label),datasets:[{label:'Сумма расходов',data:months.map(x=>x.value)}]},options:{responsive:true,plugins:{title:{display:true,text:'Расходы по месяцам'}}}});
+ } catch(e){console.error(e);}
+})();</script><a class="button secondary" href="/">Назад к расходам</a>
 {{end}}</main></body></html>`))
 
 type templateData struct {
@@ -84,22 +132,49 @@ func (a *App) routes() http.Handler {
 	mux.HandleFunc("/login", a.loginHandler)
 	mux.HandleFunc("/register", a.registerHandler)
 	mux.HandleFunc("/logout", a.logoutHandler)
-	mux.HandleFunc("/", a.authRequired(a.homeHandler))
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/" {
+			writeErrorPage(w, http.StatusNotFound)
+			return
+		}
+		a.authRequired(a.homeHandler)(w, r)
+	})
 	mux.HandleFunc("/add", a.authRequired(a.addHandler))
 	mux.HandleFunc("/edit", a.authRequired(a.editHandler))
 	mux.HandleFunc("/delete", a.authRequired(a.deleteHandler))
 	mux.HandleFunc("/stats", a.authRequired(a.statsHandler))
 	mux.HandleFunc("/export.csv", a.authRequired(a.exportHandler))
-	return recoveryMiddleware(requestLogger(a.csrfCookie(mux)))
+	mux.HandleFunc("/api/stats/by-category", a.authRequired(a.statsByCategoryAPI))
+	mux.HandleFunc("/api/stats/by-month", a.authRequired(a.statsByMonthAPI))
+	return requestLogger(recoveryMiddleware(a.csrfCookie(mux)))
 }
 
 func requestLogger(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
-		next.ServeHTTP(w, r)
-		log.Printf("%s %s %s", r.Method, r.URL.Path, time.Since(start).Round(time.Millisecond))
+		sw := &statusWriter{ResponseWriter: w}
+		next.ServeHTTP(sw, r)
+		status := sw.status
+		if status == 0 {
+			status = http.StatusOK
+		}
+		log.Printf("%s %s status=%d duration=%s", r.Method, r.URL.Path, status, time.Since(start).Round(time.Millisecond))
 	})
 }
+
+func recoveryMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer func() {
+			if v := recover(); v != nil {
+				log.Printf("panic recovered: %v", v)
+				// A handler may already have written headers; still keep the server alive.
+				writeErrorPage(w, http.StatusInternalServerError)
+			}
+		}()
+		next.ServeHTTP(w, r)
+	})
+}
+
 func (a *App) csrfCookie(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if c, err := r.Cookie("csrf_token"); err != nil || c.Value == "" {
@@ -263,6 +338,10 @@ func (a *App) logoutHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *App) homeHandler(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/" {
+		writeErrorPage(w, http.StatusNotFound)
+		return
+	}
 	if r.Method != http.MethodGet {
 		http.Error(w, "Метод не поддерживается", 405)
 		return
@@ -441,6 +520,83 @@ func (a *App) statsHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	a.render(w, r, "stats", "Статистика расходов", data, Expense{})
 }
+
+type statPoint struct {
+	Label string  `json:"label"`
+	Value float64 `json:"value"`
+}
+
+func (a *App) statsByCategoryAPI(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Метод не поддерживается", http.StatusMethodNotAllowed)
+		return
+	}
+	user, ok := a.currentUser(r)
+	if !ok {
+		http.Error(w, "Требуется вход", http.StatusUnauthorized)
+		return
+	}
+	rows, err := a.db.Query(`SELECT category, SUM(amount) FROM expenses WHERE user_id=? GROUP BY category ORDER BY SUM(amount) DESC`, user.ID)
+	if err != nil {
+		log.Printf("category stats: %v", err)
+		writeErrorPage(w, http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+	out := make([]statPoint, 0)
+	for rows.Next() {
+		var p statPoint
+		if err := rows.Scan(&p.Label, &p.Value); err != nil {
+			log.Printf("category stats scan: %v", err)
+			writeErrorPage(w, 500)
+			return
+		}
+		out = append(out, p)
+	}
+	if err := rows.Err(); err != nil {
+		log.Printf("category stats rows: %v", err)
+		writeErrorPage(w, 500)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	_ = json.NewEncoder(w).Encode(out)
+}
+func (a *App) statsByMonthAPI(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Метод не поддерживается", http.StatusMethodNotAllowed)
+		return
+	}
+	user, ok := a.currentUser(r)
+	if !ok {
+		http.Error(w, "Требуется вход", http.StatusUnauthorized)
+		return
+	}
+	rows, err := a.db.Query(`SELECT substr(expense_date,1,7), SUM(amount) FROM expenses WHERE user_id=? AND length(expense_date)>=7 GROUP BY substr(expense_date,1,7) ORDER BY substr(expense_date,1,7)`, user.ID)
+	if err != nil {
+		log.Printf("monthly stats: %v", err)
+		writeErrorPage(w, 500)
+		return
+	}
+	defer rows.Close()
+	out := make([]statPoint, 0)
+	for rows.Next() {
+		var p statPoint
+		if err := rows.Scan(&p.Label, &p.Value); err != nil {
+			log.Printf("monthly stats scan: %v", err)
+			writeErrorPage(w, 500)
+			return
+		}
+		out = append(out, p)
+	}
+	if err := rows.Err(); err != nil {
+		log.Printf("monthly stats rows: %v", err)
+		writeErrorPage(w, 500)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	_ = json.NewEncoder(w).Encode(out)
+}
+
 func (a *App) exportHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "Метод не поддерживается", 405)
@@ -468,10 +624,6 @@ func (a *App) exportHandler(w http.ResponseWriter, r *http.Request) {
 		_ = cw.Write([]string{category, fmt.Sprintf("%.2f", amount), date})
 	}
 	cw.Flush()
-	if err := rows.Err(); err != nil {
-		log.Println("Ошибка чтения расходов для экспорта:", err)
-		return
-	}
 	if err := cw.Error(); err != nil {
 		log.Println(err)
 	}
@@ -533,16 +685,4 @@ func pbkdf2SHA256(password, salt []byte, iterations, keyLen int) []byte {
 		out = append(out, t...)
 	}
 	return out[:keyLen]
-}
-func recoveryMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		defer func() {
-			if err := recover(); err != nil {
-				log.Printf("Panic recovered: %v", err)
-				http.Error(w, "Internal Server Error", http.StatusInternalServerError)
-			}
-		}()
-
-		next.ServeHTTP(w, r)
-	})
 }
